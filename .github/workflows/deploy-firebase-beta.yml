@@ -1,0 +1,147 @@
+name: Deploy HAIPAC beta to Firebase
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: haipac-firebase-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            functions/package-lock.json
+            email-functions/package-lock.json
+      - name: Install frontend build dependencies
+        run: npm ci
+      - name: Install Functions dependencies
+        run: npm ci --prefix functions
+      - name: Install email Functions dependencies
+        run: npm ci --prefix email-functions
+      - name: Build beta frontend
+        run: npm run build
+        env:
+          HAIPAC_MODE: production
+          HAIPAC_API_BASE_URL: /api/
+      - name: Compile Cloud Functions
+        run: npm --prefix functions run build
+      - name: Run logistics and role checks
+        run: npm --prefix functions test
+      - name: Authenticate to the HAIPAC Google Cloud project with GitHub OIDC
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: haipac-7e19d
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - name: Set up Google Cloud SDK for secret metadata checks
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          project_id: haipac-7e19d
+          version: '>= 363.0.0'
+      - name: Verify required API secret names and enabled versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          required_secrets=(
+            SMARTCUT_HMAC_SECRET
+            CLAIM_TOKEN_ENCRYPTION_KEY
+            DELIVERY_CODE_SECRET
+            TRACKING_RATE_LIMIT_SECRET
+            CRON_SECRET
+          )
+          failed=0
+          for secret in "${required_secrets[@]}"; do
+            if ! gcloud secrets describe "$secret" --project=haipac-7e19d --format='value(name)' >/dev/null; then
+              echo "Cannot verify required Secret Manager metadata for: $secret" >&2
+              failed=1
+              continue
+            fi
+            if ! versions="$(gcloud secrets versions list "$secret" --project=haipac-7e19d --filter='state=ENABLED' --format='value(name)')"; then
+              echo "Cannot verify enabled Secret Manager versions for: $secret" >&2
+              failed=1
+              continue
+            fi
+            if [[ -z "$versions" ]]; then
+              echo "Required secret has no enabled version: $secret" >&2
+              failed=1
+            fi
+          done
+          if [[ "$failed" -ne 0 ]]; then
+            echo "Beta deployment stopped before Hosting provisioning." >&2
+            exit 1
+          fi
+          echo "All five API codebase Secret Manager resources have an enabled version."
+      - name: Verify Cloud Functions artifact cleanup configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          repository="$(gcloud artifacts repositories describe gcf-artifacts \
+            --project=haipac-7e19d --location=us-east4 --format=json)"
+          if ! printf '%s' "$repository" | jq -e '
+            .labels["firebase-functions-cleanup-opted-out"] == "true"
+            or ((.cleanupPolicies // {}) | length > 0)
+          ' >/dev/null; then
+            echo "No Cloud Functions artifact cleanup policy or explicit opt-out exists in us-east4." >&2
+            echo "Have the HAIPAC project owner configure it before deployment; GitHub is intentionally not granted repository-policy write permissions." >&2
+            exit 1
+          fi
+          echo "Artifact cleanup configuration is present."
+      - name: Configure beta Functions parameters
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require("node:fs");
+          const parameters = [
+            "HAIPAC_FUNCTION_REGION=us-east4",
+            "HAIPAC_RUNTIME_SERVICE_ACCOUNT=haipac-functions-runtime@haipac-7e19d.iam.gserviceaccount.com",
+            "HAIPAC_PUBLIC_URL=https://haipac-7e19d.web.app",
+            "EMAIL_FROM=",
+            "EMAIL_PROVIDER_CONFIGURED=false",
+            "LEGAL_CONTENT_APPROVED=false",
+            "OPERATIONS_READY=false",
+            "",
+          ].join("\n");
+          fs.writeFileSync("functions/.env.haipac-7e19d", parameters, { mode: 0o600 });
+          console.log("Beta Functions parameters configured; email and operational readiness remain disabled.");
+          NODE
+      - name: Provision the default Firebase Hosting site if needed
+        run: |
+          sites_json="$(npm exec -- firebase hosting:sites:list --project haipac-7e19d --json)"
+          site_exists="$(printf '%s' "$sites_json" | node -e '
+            let raw = "";
+            process.stdin.on("data", (chunk) => { raw += chunk; });
+            process.stdin.on("end", () => {
+              const payload = JSON.parse(raw);
+              const sites = payload.result?.sites ?? [];
+              const exists = sites.some((site) => site.name === "projects/haipac-7e19d/sites/haipac-7e19d");
+              process.stdout.write(exists ? "true" : "false");
+            });
+          ')"
+          if [ "$site_exists" != "true" ]; then
+            npm exec -- firebase hosting:sites:create haipac-7e19d --project haipac-7e19d --non-interactive
+          fi
+      - name: Deploy beta frontend to Firebase Hosting
+        run: npm exec -- firebase deploy --project haipac-7e19d --only hosting --non-interactive
+      - name: Verify beta frontend
+        run: |
+          curl --fail --silent --show-error --retry 8 --retry-delay 5 https://haipac-7e19d.web.app/ --output /dev/null
+      - name: Deploy beta API codebase
+        run: npm exec -- firebase deploy --project haipac-7e19d --only functions:haipac-api --non-interactive
+      - name: Verify beta communes API
+        run: |
+          curl --fail --silent --show-error --retry 8 --retry-delay 5 https://haipac-7e19d.web.app/api/v1/communes --output /dev/null

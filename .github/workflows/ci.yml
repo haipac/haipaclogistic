@@ -1,0 +1,67 @@
+name: Validate HAIPAC static site and Firebase Functions
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            functions/package-lock.json
+            email-functions/package-lock.json
+      - name: Install frontend build dependencies
+        run: npm ci
+      - name: Build static site for an isolated local environment
+        run: npm run build
+      - name: Validate public routes and local links
+        run: npm run validate:site
+      - name: Install Cloud Functions dependencies
+        run: npm ci --prefix functions
+      - name: Install email Functions dependencies
+        run: npm ci --prefix email-functions
+      - name: Compile Cloud Functions
+        run: npm --prefix functions run build
+      - name: Run backend unit tests
+        run: npm --prefix functions test
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Prepare synthetic emulator-only configuration
+        run: |
+          cat > functions/.env.local <<'EOF'
+          LEGAL_CONTENT_APPROVED=true
+          OPERATIONS_READY=true
+          HAIPAC_PUBLIC_URL=https://haipac.example.test
+          EOF
+          cat > functions/.secret.local <<'EOF'
+          SMARTCUT_HMAC_SECRET=synthetic-emulator-hmac-secret-with-more-than-32-bytes
+          CLAIM_TOKEN_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+          DELIVERY_CODE_SECRET=synthetic-emulator-delivery-secret-with-more-than-32-bytes
+          TRACKING_RATE_LIMIT_SECRET=synthetic-emulator-rate-limit-secret-with-more-than-32-bytes
+          CRON_SECRET=synthetic-emulator-cron-secret-with-more-than-32-bytes
+          EOF
+      - name: Test signed quote-to-shipment flow in Firebase Emulators
+        run: npm exec -- firebase emulators:exec --project haipac-7e19d --only firestore,functions,hosting "npm --prefix functions run test:integration"
+        env:
+          FIREBASE_PROJECT_ID: haipac-7e19d
+          FIRESTORE_EMULATOR_HOST: 127.0.0.1:8080
+          HAIPAC_TEST_BASE_URL: http://127.0.0.1:5000
+          SMARTCUT_HMAC_SECRET: synthetic-emulator-hmac-secret-with-more-than-32-bytes
+          CLAIM_TOKEN_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      - name: Remove emulator-only configuration
+        if: always()
+        run: rm -f functions/.env.local functions/.secret.local

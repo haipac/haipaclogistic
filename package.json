@@ -1,0 +1,22 @@
+{
+  "name": "haipac-logistics",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "node scripts/build-static.mjs",
+    "validate:site": "node scripts/validate-static-site.mjs",
+    "firebase:emulators": "firebase emulators:start --only auth,firestore,functions,hosting",
+    "firebase:seed-admin": "node scripts/seed-admin.mjs"
+  },
+  "dependencies": {
+    "firebase": "^13.2.0",
+    "firebase-admin": "^14.5.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "firebase-tools": "^15.36.0"
+  },
+  "overrides": {
+    "@grpc/grpc-js": "^1.14.7"
+  }
+}

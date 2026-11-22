@@ -1,0 +1,25 @@
+{
+  "name": "haipac-firebase-functions",
+  "version": "0.1.0",
+  "private": true,
+  "main": "lib/index.js",
+  "engines": {
+    "node": "22"
+  },
+  "scripts": {
+    "build": "tsc --noEmit -p tsconfig.json && node build.mjs",
+    "test": "tsx --test src/api.test.ts src/lib/logistics/rates.test.ts src/lib/firebase/user-roles.test.ts src/lib/legal-content.test.ts src/lib/admin-policies.test.ts src/lib/api/production-readiness.test.ts",
+    "test:integration": "node ../scripts/run-haipac-flow-integration.mjs"
+  },
+  "dependencies": {
+    "firebase-admin": "^14.5.0",
+    "firebase-functions": "^7.4.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}

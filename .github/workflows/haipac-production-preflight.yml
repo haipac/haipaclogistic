@@ -1,0 +1,260 @@
+name: HAIPAC production readiness preflight
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: haipac-firebase-readonly-preflight
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Authenticate to the HAIPAC Google Cloud project with GitHub OIDC
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: haipac-7e19d
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          project_id: haipac-7e19d
+          version: '>= 363.0.0'
+      - name: Check Secret Manager metadata without reading secret values
+        shell: bash
+        run: |
+          set -uo pipefail
+          secrets=(
+            SMARTCUT_HMAC_SECRET
+            CLAIM_TOKEN_ENCRYPTION_KEY
+            DELIVERY_CODE_SECRET
+            TRACKING_RATE_LIMIT_SECRET
+            RESEND_API_KEY
+            CRON_SECRET
+          )
+          blocked=0
+          {
+            echo '## HAIPAC production preflight (read-only)'
+            echo
+            echo 'Secret Manager values were not read. Only resource existence and enabled-version metadata were checked.'
+            echo
+            echo '| Resource | Metadata result |'
+            echo '| --- | --- |'
+          } >> "$GITHUB_STEP_SUMMARY"
+          for secret in "${secrets[@]}"; do
+            if ! gcloud secrets describe "$secret" --project=haipac-7e19d --format='value(name)' >/dev/null 2>&1; then
+              echo "| $secret | missing or not readable |" | tee -a "$GITHUB_STEP_SUMMARY"
+              blocked=1
+              continue
+            fi
+            versions="$(gcloud secrets versions list "$secret" --project=haipac-7e19d --filter='state=ENABLED' --format='value(name)' 2>/dev/null || true)"
+            if [[ -n "$versions" ]]; then
+              echo "| $secret | resource exists; at least one enabled version |" | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              echo "| $secret | resource exists; no enabled version or versions are not readable |" | tee -a "$GITHUB_STEP_SUMMARY"
+              blocked=1
+            fi
+          done
+          if [[ "$blocked" -eq 0 ]]; then
+            echo >> "$GITHUB_STEP_SUMMARY"
+            echo 'All six required secret resources have enabled versions.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Check Functions artifact cleanup metadata
+        shell: bash
+        run: |
+          set -uo pipefail
+          repository="$(gcloud artifacts repositories describe gcf-artifacts --project=haipac-7e19d --location=us-east4 --format=json 2>/dev/null || true)"
+          if [[ -z "$repository" ]]; then
+            echo '| `gcf-artifacts` cleanup | missing or not readable |' | tee -a "$GITHUB_STEP_SUMMARY"
+          elif printf '%s' "$repository" | jq -e '.labels["firebase-functions-cleanup-opted-out"] == "true"' >/dev/null; then
+            echo '| `gcf-artifacts` cleanup | explicit opt-out; one-day retention not configured |' | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            cleanup_dry_run="$(printf '%s' "$repository" | jq -r '(.cleanupPolicyDryRun // false) | tostring')"
+            if printf '%s' "$repository" | jq -e '[.cleanupPolicies[]? | select(.action == "DELETE" and .condition.olderThan == "86400s")] | length > 0' >/dev/null; then
+              if [[ "$cleanup_dry_run" == "true" ]]; then
+                echo '| `gcf-artifacts` cleanup | one-day delete policy present, but dry-run only |' | tee -a "$GITHUB_STEP_SUMMARY"
+              else
+                echo '| `gcf-artifacts` cleanup | active delete policy for images older than one day |' | tee -a "$GITHUB_STEP_SUMMARY"
+              fi
+            else
+              echo "| \`gcf-artifacts\` cleanup | policy present; active one-day delete not confirmed (dry-run=$cleanup_dry_run) |" | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+      - name: Check production variables without printing their values
+        shell: bash
+        env:
+          EMAIL_FROM: ${{ vars.EMAIL_FROM }}
+          HAIPAC_PUBLIC_URL: ${{ vars.HAIPAC_PUBLIC_URL }}
+          LEGAL_CONTENT_APPROVED: ${{ vars.LEGAL_CONTENT_APPROVED }}
+          OPERATIONS_READY: ${{ vars.OPERATIONS_READY }}
+          HAIPAC_INDEXING_ENABLED: ${{ vars.HAIPAC_INDEXING_ENABLED }}
+        run: |
+          set -uo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const out = process.env.GITHUB_STEP_SUMMARY;
+          const lines = ['','| Production setting | Result |','| --- | --- |'];
+          const sender = (process.env.EMAIL_FROM ?? '').trim();
+          const match = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+)$/.exec(sender);
+          const domain = match?.[1]?.toLowerCase();
+          lines.push(`| EMAIL_FROM | ${match && (domain === 'haipaclogistics.com' || domain.endsWith('.haipaclogistics.com')) ? 'configured under HAIPAC domain (value hidden)' : 'missing or outside HAIPAC domain (value hidden)'} |`);
+          const publicUrl = (process.env.HAIPAC_PUBLIC_URL ?? '').trim();
+          lines.push(`| HAIPAC_PUBLIC_URL | ${!publicUrl || publicUrl === 'https://haipac-7e19d.web.app' || publicUrl === 'https://www.haipaclogistics.com' ? 'unset/default or supported URL (value hidden)' : 'unsupported URL (value hidden)'} |`);
+          for (const [name, raw] of Object.entries({
+            LEGAL_CONTENT_APPROVED: process.env.LEGAL_CONTENT_APPROVED,
+            OPERATIONS_READY: process.env.OPERATIONS_READY,
+            HAIPAC_INDEXING_ENABLED: process.env.HAIPAC_INDEXING_ENABLED,
+          })) {
+            const value = (raw ?? '').trim().toLowerCase() || 'false (default)';
+            lines.push(`| ${name} | ${value === 'true' || value === 'false' || value === 'false (default)' ? value : 'invalid value (hidden)'} |`);
+          }
+          const legal = (process.env.LEGAL_CONTENT_APPROVED ?? '').trim().toLowerCase() === 'true';
+          const operations = (process.env.OPERATIONS_READY ?? '').trim().toLowerCase() === 'true';
+          const indexing = (process.env.HAIPAC_INDEXING_ENABLED ?? '').trim().toLowerCase() === 'true';
+          const indexingAllowed = !indexing || (
+            legal
+            && operations
+            && publicUrl === 'https://www.haipaclogistics.com'
+          );
+          lines.push(`| Indexing prerequisites | ${indexingAllowed ? 'satisfied or indexing disabled' : 'blocked: approvals and verified www URL required'} |`);
+          fs.appendFileSync(out, lines.join('\n') + '\n');
+          console.log(lines.join('\n'));
+          NODE
+      - name: Check website and sender DNS without changing records
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo '| DNS record | Result |' >> "$GITHUB_STEP_SUMMARY"
+          echo '| --- | --- |' >> "$GITHUB_STEP_SUMMARY"
+
+          www_cname="$(dig +short CNAME www.haipaclogistics.com | tail -n 1 | sed 's/\.$//')"
+          if [[ "$www_cname" == "haipac-7e19d.web.app" ]]; then
+            echo '| `www` CNAME | points to Firebase Hosting |' | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo '| `www` CNAME | not yet on Firebase Hosting |' | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+          apex_a="$(dig +short A haipaclogistics.com | sort -V | paste -sd ',' -)"
+          if [[ "$apex_a" == "199.36.158.100" ]]; then
+            echo '| Apex A record | Firebase Hosting target present |' | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo '| Apex A record | not yet the Firebase target; remove only confirmed Squarespace web A records |' | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+          apex_hosting_marker="$(dig +short TXT haipaclogistics.com | tr -d '"' | grep -Fx 'hosting-site=haipac-7e19d' || true)"
+          if [[ -n "$apex_hosting_marker" ]]; then
+            echo '| Apex Firebase ownership TXT | present |' | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo '| Apex Firebase ownership TXT | missing |' | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+          resend_domain_cname="$(dig +short CNAME rsend.mail.haipaclogistics.com | tail -n 1 | sed 's/\.$//')"
+          if [[ "$resend_domain_cname" == "rsend.forge.rmta.net" ]]; then
+            echo '| Resend domain CNAME | present |' | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo '| Resend domain CNAME | missing or different |' | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+          resend_mail_cname="$(dig +short CNAME send.mail.haipaclogistics.com | tail -n 1 | sed 's/\.$//')"
+          if [[ "$resend_mail_cname" == "send.forge.rmta.net" ]]; then
+            echo '| Resend return-path CNAME | present |' | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo '| Resend return-path CNAME | missing or different |' | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+          resend_dkim="$(dig +short TXT resend._domainkey.mail.haipaclogistics.com)"
+          if [[ -n "$resend_dkim" ]]; then
+            echo '| Resend DKIM TXT | present (value hidden) |' | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo '| Resend DKIM TXT | missing |' | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+          dmarc="$(dig +short TXT _dmarc.haipaclogistics.com | tr -d '"' | grep -i '^v=DMARC1' || true)"
+          if [[ -n "$dmarc" ]]; then
+            echo '| DMARC TXT | present (value hidden) |' | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo '| DMARC TXT | missing |' | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Check deployed Function and scheduler metadata
+        shell: bash
+        run: |
+          set -uo pipefail
+          functions="$(gcloud functions list --v2 --regions=us-east4 --project=haipac-7e19d --format=json 2>/dev/null || true)"
+          if [[ -z "$functions" ]] || ! printf '%s' "$functions" | jq -e 'type == "array"' >/dev/null; then
+            echo '| Cloud Functions | deployment metadata unavailable |' | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            api_state="$(printf '%s' "$functions" | jq -r '[.[] | select((.name | split("/")[-1]) == "api") | .state][0] // "MISSING"')"
+            email_state="$(printf '%s' "$functions" | jq -r '[.[] | select((.name | split("/")[-1]) == "processHaipacEmailOutbox") | .state][0] // "MISSING"')"
+            echo "| HAIPAC API function (us-east4) | $api_state |" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "| HAIPAC email outbox function (us-east4) | $email_state |" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+          jobs="$(gcloud scheduler jobs list --location=us-east4 --project=haipac-7e19d --format=json 2>/dev/null || true)"
+          if [[ -z "$jobs" ]] || ! printf '%s' "$jobs" | jq -e 'type == "array"' >/dev/null; then
+            echo '| HAIPAC email scheduler | metadata unavailable |' | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            job="$(printf '%s' "$jobs" | jq -c '[.[] | select((.name | split("/")[-1]) == "firebase-schedule-processHaipacEmailOutbox-us-east4")][0] // empty')"
+            if [[ -z "$job" ]]; then
+              echo '| HAIPAC email scheduler | not deployed |' | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              state="$(printf '%s' "$job" | jq -r '.state // "UNKNOWN"')"
+              schedule="$(printf '%s' "$job" | jq -r '.schedule // "UNKNOWN"')"
+              timezone="$(printf '%s' "$job" | jq -r '.timeZone // "UNKNOWN"')"
+              echo "| HAIPAC email scheduler | state=$state; schedule=$schedule; timezone=$timezone |" | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+      - name: Check Firebase Hosting custom-domain and certificate state
+        shell: bash
+        run: |
+          set -uo pipefail
+          token="$(gcloud auth print-access-token 2>/dev/null || true)"
+          if [[ -z "$token" ]]; then
+            echo '| Firebase custom domains | API authentication unavailable |' | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          response="$(curl --silent --show-error --fail --max-time 30 \
+            -H "Authorization: Bearer $token" \
+            'https://firebasehosting.googleapis.com/v1beta1/projects/haipac-7e19d/sites/haipac-7e19d/customDomains?pageSize=100' \
+            2>/dev/null || true)"
+          unset token
+          if [[ -z "$response" ]] || ! printf '%s' "$response" | jq -e '.customDomains | type == "array"' >/dev/null; then
+            echo '| Firebase custom domains | status API unavailable or not readable |' | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo
+            echo '### Firebase custom domains (status only; DNS challenge values are hidden)'
+            echo
+            echo '| Domain | Host | Ownership | Certificate | Host issues | Cert issues | DNS changes | Last DNS check |'
+            echo '| --- | --- | --- | --- | ---: | ---: | --- | --- |'
+          } >> "$GITHUB_STEP_SUMMARY"
+          count="$(printf '%s' "$response" | jq '.customDomains | length')"
+          if [[ "$count" -eq 0 ]]; then
+            echo '| none returned | — | — | — | — | — | — | — |' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          while IFS=$'\t' read -r domain host ownership cert host_issues cert_issues dns_changes dns_check_time; do
+            [[ -n "$domain" ]] || continue
+            printf '| `%s` | `%s` | `%s` | `%s` | %s | %s | %s | %s |\n' \
+              "$domain" "$host" "$ownership" "$cert" "$host_issues" "$cert_issues" "$dns_changes" "$dns_check_time" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+          done < <(printf '%s' "$response" | jq -r '
+            .customDomains[] |
+            [
+              (.name | split("/")[-1]),
+              (.hostState // "unknown"),
+              (.ownershipState // "unknown"),
+              (.cert.state // "unknown"),
+              (([.issues[]?.code] | map(select(. != null)) | unique | length) | tostring),
+              (([.cert.issues[]?.code] | map(select(. != null)) | unique | length) | tostring),
+              (([.requiredDnsUpdates.discovered[]?.records[]?, .requiredDnsUpdates.desired[]?.records[]?] | map(select(.requiredAction != null and .requiredAction != "NONE") | "\(.type):\(.requiredAction)") | unique | join(", ")) // "none reported"),
+              (.requiredDnsUpdates.checkTime // "not reported")
+            ] | @tsv
+          ')
