@@ -9,7 +9,7 @@
     "firebase:seed-admin": "node scripts/seed-admin.mjs"
   },
   "dependencies": {
-    "firebase": "^13.2.0",
+    "firebase": "^13.4.0",
     "firebase-admin": "^14.5.0"
   },
   "devDependencies": {
