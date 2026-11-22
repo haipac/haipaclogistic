@@ -36,7 +36,7 @@ jobs:
         run: npm --prefix functions run build
       - name: Run backend unit tests
         run: npm --prefix functions test
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "21"
