@@ -1,0 +1,61 @@
+name: Publish HAIPAC to GitHub Pages
+
+on:
+  push:
+    branches:
+      - haipac-project-import
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build the public site
+        run: npm run build
+        env:
+          HAIPAC_BASE_PATH: /
+          HAIPAC_MODE: production
+          HAIPAC_API_BASE_URL: https://us-east4-haipac-7e19d.cloudfunctions.net/api/
+          HAIPAC_PUBLIC_URL: https://www.haipaclogistics.com
+          HAIPAC_INDEXING_ENABLED: "false"
+          LEGAL_CONTENT_APPROVED: "false"
+          OPERATIONS_READY: "false"
+
+      - name: Validate the static artifact
+        run: npm run validate:site
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload the built site
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish the built site
+        id: deployment
+        uses: actions/deploy-pages@v4
